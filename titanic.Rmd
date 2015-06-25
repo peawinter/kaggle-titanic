@@ -1,0 +1,934 @@
+---
+title: "Titanic"
+author: "Wenyu Wang"
+date: "June 6, 2015"
+output: html_document
+---
+
+```{r init, echo=FALSE}
+# clean data
+rm(list = ls())
+library(ROCR)
+library(pROC)
+library(readr)
+library(lattice)
+library(ggplot2)
+library(caret)
+library(rpart)
+library(caretEnsemble)
+set.seed(1708)
+```
+
+## Import data and pre-processing
+
+Import data using `read_csv` from `readr`.
+
+```{r process-data}
+training <- read_csv("data/train.csv")
+testing  <- read_csv("data/test.csv")
+
+testing$Survived <- NaN
+dt <- rbind(training, testing)
+
+names(dt) <- tolower(names(dt))
+
+# title
+dt$title <- sapply(dt$name, FUN=function(x) {strsplit(x, split='[,.]')[[1]][2]})
+dt$title <- sub(' ', '', dt$title)
+dt$title[dt$title %in% c('Mme', 'Mlle', 'Dona', 'Lady', 'the Countess', 'Jonkheer', 'Miss', 'Ms', 'Mrs')] <- 'Ms'
+dt$title[dt$title %in% c('Capt', 'Don', 'Major', 'Sir', 'Dr', 'Col')] <- 'Sir'
+dt$title <- factor(dt$title)
+
+# cabin
+dt$cabin <- sapply(dt$cabin, FUN=function(x) {strsplit(x, split='')[[1]][1]})
+dt$cabin[is.na(dt$cabin)] <- 'N'
+
+# Age and fare NaN
+agefit <- rpart(age ~ pclass + sex + sibsp + parch + fare + embarked + title, data = dt[!is.na(dt$age),], method="anova")
+farefit <- rpart(fare ~  age + pclass + sex + sibsp + parch + embarked + title, data = dt[!is.na(dt$fare), ], method="anova")
+
+# Replace missing values in AGE and FARE with prediction
+dt$age[is.na(dt$age)] <- predict(agefit, dt)[is.na(dt$age)]
+dt$fare[is.na(dt$fare)] <- predict(farefit, dt)[is.na(dt$fare)]
+
+# Embarked
+dt$embarked[dt$embarked == ""] <- "Q"
+dt$embarked <- as.factor(dt$embarked)
+
+save(dt, file = 'data/data_cleaned_3.RData')
+
+# split data into training and testing
+training = dt[!is.na(dt$survived), ]
+testing = dt[is.na(dt$survived), ]
+```
+
+### Plot 
+
+```{r plot, eval=FALSE}
+# histogram by age
+ggplot(training, aes(x = age, fill = as.factor(survived))) +
+  geom_bar(binwidth = 1, position = 'fill') +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ") +
+  ggtitle("Survived by Age")
+
+ggplot(training, aes(x = age, fill = as.factor(survived))) +
+  geom_bar(binwidth = 7, position = 'fill') +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ") +
+  ggtitle("Survived by Age")
+
+## 0 - 6 high survival rate
+## 7 - .. low survival rate
+
+pvalue_list <- rep(0, 50)
+for (i in 1:50) {
+  print(chisq.test(table(training$age <= i, training$survived))[[3]])
+  pvalue_list[i] = chisq.test(table(training$age <= i, training$survived))[[3]]
+}
+
+qplot(x = age, y = pvalue, data = data.frame(pvalue = pvalue_list, age = 1:50), 
+      geom=c("point", "smooth"), 
+      method="lm", formula=y~x) +
+  geom_abline(intercept = 0.05, slope = 0)
+
+age1 <- which.min(pvalue_list)
+
+## Take the first tipping point at age = 6
+
+pvalue_list_2 <- rep(0, 50 - age1)
+for (i in 1:(50 - age1)) {
+  pvalue_list_2[i] = chisq.test(table(training$age[training$age > age1] <= i + age1, training$survived[training$age > age1]))[[3]]
+}
+
+qplot(x = age, y = pvalue, data = data.frame(pvalue = pvalue_list_2, age = (age1 + 1):50), 
+      geom=c("point", "smooth"), 
+      method="lm", formula=y~x) +
+  geom_abline(intercept = 0.05, slope = 0)
+
+age2 <- which.min(pvalue_list_2) + age1
+
+## age2 = 29
+
+# histogram by sex
+ggplot(training, aes(x = sex, fill = as.factor(survived))) +
+  geom_bar() +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+# histogram by age and sex and class
+ggplot(training) +
+  geom_histogram(aes(x=(age > age1) + (age > age2), fill = factor(survived)), binwidth = 1, alpha=1, position = 'fill') +
+  facet_wrap(~ sex + pclass + embarked) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+ggplot(training) +
+  geom_histogram(aes(x=(age > age1) + (age > age2), fill = factor(survived)), binwidth = 1, alpha=1, position = 'fill') +
+  facet_wrap(~ title + pclass + embarked) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+# fare
+ggplot(training, aes(x = fare, fill = as.factor(survived))) + 
+  geom_bar(binwidth = 5, position = 'fill') +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+pvalue_list_fare <- rep(0, 100)
+for (i in 1:100) {
+  pvalue_list_fare[i] = chisq.test(table(training$fare <= i, training$survived))[[3]]
+}
+
+qplot(x = fare, y = pvalue, data = data.frame(pvalue = pvalue_list_fare, fare = 1:100), 
+      geom=c("point", "smooth"), 
+      method="lm", formula=y~x) +
+  geom_abline(intercept = 0.05, slope = 0)
+
+fare1 <- which.min(pvalue_list_fare)
+
+## fare1 = 11
+pvalue_list_fare_2 <- rep(0, 100 - fare1)
+for (i in 1:(100 - fare1)) {
+  pvalue_list_fare_2[i] = chisq.test(table(training$fare[training$fare > fare1] <= i + fare1, training$survived[training$fare > fare1]))[[3]]
+}
+
+qplot(x = fare, y = pvalue, data = data.frame(pvalue = pvalue_list_fare_2, fare = (fare1 + 1):100), 
+      geom=c("point", "smooth"), 
+      method="lm", formula=y~x) +
+  geom_abline(intercept = 0.05, slope = 0)
+
+fare2 <- which.min(pvalue_list_fare_2) + fare1
+
+ggplot(training) +
+  geom_histogram(aes(x=fare, fill = factor(survived)), binwidth = 5, alpha=1, position = 'fill') +
+  facet_wrap(~ title + pclass) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+ggplot(training) +
+  geom_histogram(aes(x=(fare > fare1) + (fare > fare2), fill = factor(survived)), binwidth = 1, alpha=1, position = 'fill') +
+  facet_wrap(~ title + pclass) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+# the plot shows fare2 is not significant when title and other factors are considered. 
+
+# histogram by sibsp
+ggplot(training, aes(x = sibsp, fill = as.factor(survived))) + 
+  geom_bar(binwidth = 1, position = 'Fill') +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+pvalue_list_sibsp <- rep(0, 5)
+for (i in 1:5) {
+  print(chisq.test(table(training$age == i, training$survived))[[3]])
+  pvalue_list_sibsp[i] = chisq.test(table(training$sibsp <= i, training$survived))[[3]]
+}
+
+qplot(x = sibsp, y = pvalue, data = data.frame(pvalue = pvalue_list_sibsp, sibsp = 1:5), 
+      geom=c("point", "smooth"), 
+      method="lm", formula=y~x) +
+  geom_abline(intercept = 0.05, slope = 0)
+
+# sibsp alone is not significant, how about age, sex, title.
+
+ggplot(training) +
+  geom_histogram(aes(x=sibsp >= 2, fill = factor(survived)), binwidth = 1, alpha=1, position = 'fill') +
+  facet_wrap(~ title + pclass) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+# sibsp = 2 is more informatic
+sibsp1 = 2
+
+# parch
+ggplot(training, aes(x = parch, fill = as.factor(survived))) + 
+  geom_bar(binwidth = 1) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+# it's hard to tell the tipping point of parch by looking at it alone
+ggplot(training) +
+  geom_histogram(aes(x=parch, fill = factor(survived)), binwidth = 1, alpha=1, position = 'fill') +
+  facet_wrap(~ title + sibsp) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+# no clue~~~
+
+# histogram by embarked port
+ggplot(training, aes(x = embarked, fill = as.factor(survived))) + 
+  geom_bar(binwidth = 1, position='fill') +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+ggplot(training) +
+  geom_histogram(aes(x=embarked, fill = factor(survived)), binwidth = 5, alpha=1, position = 'fill') +
+  facet_wrap(~ pclass + title) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+# sum(training$sex == 'male' & training$embarked == 'Q')
+
+# histogram by title
+ggplot(training, aes(x = title, fill = as.factor(survived))) + 
+  geom_bar(binwidth = 1, position='Fill') +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ") +
+  ggtitle("Survived by Title")
+
+ggplot(training) +
+  geom_histogram(aes(x=title, fill = factor(survived)), binwidth = 1, alpha=1, position = 'fill') +
+  facet_wrap(~ embarked + pclass) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+
+# histogram by cabin
+ggplot(training, aes(x = cabin, fill = as.factor(survived))) + 
+  geom_bar(binwidth = 1, position='Fill') +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ") +
+  ggtitle("Survived by Cabin")
+
+table(training$cabin == 'F', training$survived)
+
+ggplot(training) +
+  geom_histogram(aes(x=title, fill = factor(survived)), binwidth = 1, alpha=1, position = 'fill') +
+  facet_wrap(~ pclass + cabin) +
+  theme(legend.position="bottom") +
+  scale_fill_discrete(name="Survived: ")
+```
+
+Among all factors, *Sex*, *Age*, and *Pclass* are most significant. 
+
+1. Age
+  - age <= 6
+  - age > 6 and age <= 29
+  - age > 29
+2. Fare
+  - fare <= 11
+  - fare > 11
+3. SibSp
+  - sibsp <= 1
+  - sibsp > 1
+4. Cabin
+  - Group A: A - E
+  - Group B: G, N
+  - Group C: F, T
+  
+```{r features}
+# Age bin
+dt$agebin <- as.numeric((dt$age > 31) + (dt$age > 6))
+# Fare bin
+dt$farebin <- as.numeric(dt$fare > 11)
+# Sibsp bin
+dt$familysize <- as.numeric(dt$sibsp + dt$parch > 3)
+# Cabin bin
+dt$cabinbin <- as.numeric(dt$cabin %in% c("T", "F") + 2 * as.numeric(dt$cabin %in% c("G", "N") ))
+
+# remove name and ticket column
+nokeep <- c('name', 'ticket')
+dt <- dt[ , -which(names(dt) %in% nokeep)]
+
+# as numeric
+dt <- within(dt, pclass <- as.factor(pclass))
+dt <- within(dt, agebin <- as.factor(agebin))
+dt <- within(dt, farebin <- as.factor(farebin))
+dt <- within(dt, familysize <- as.factor(familysize))
+dt <- within(dt, cabinbin <- as.factor(cabinbin))
+
+save(dt, file = 'data/data_cleaned_4.RData')
+
+# split data into training and testing
+training = dt[!is.na(dt$survived), ]
+testing = dt[is.na(dt$survived), ]
+
+training <- within(training, survived <- factor(as.factor(survived), labels = c('No', 'Yes')))
+```
+
+### Models
+
+Refine the random forest model.
+
+Insights:
+
+- `importance: True`. 
+
+```{r randomForest}
+# control part
+my_control <- trainControl(
+  method='repeatedcv',
+  number=5,
+  repeats=5,
+  savePredictions=TRUE,
+  classProbs=TRUE,
+  index=createResample(training$survived, 25),
+  summaryFunction=twoClassSummary
+)
+
+my_grid <- expand.grid(.mtry = 3)
+
+######
+# 1. 
+# calibrate mtry 
+
+my_RF1 <- train(
+  survived ~ .,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  metric = "ROC", 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+# ROC was used to select the optimal model using  the largest value. 
+# The final value used for the model was mtry = 3. 
+
+#####
+# 2.
+# use mtry = 3 with all variables as benchmark
+
+my_grid <- expand.grid(.mtry = 3)
+
+my_RF2 <- train(
+  survived ~ .,
+  data = training, 
+  method = 'rf',
+  importance = F, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+# variable importance
+
+my_RF2_imp <- varImp(my_RF2, scale = TRUE)
+plot(my_RF2_imp)
+
+####
+# 3.
+# keep top 12 variables
+
+my_RF3 <- train(
+  survived ~ sex + title + fare + age + pclass + cabinbin + sibsp + farebin + familysize + parch + embarked + agebin,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF3_imp <- varImp(my_RF3, scale = TRUE)
+plot(my_RF3_imp)
+
+## first three random forest models, the third one is best
+# ROC 
+#       Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF1 0.8533  0.8735 0.8798 0.8802  0.8908 0.9070    0
+# RF2 0.8538  0.8731 0.8784 0.8798  0.8895 0.9076    0
+# RF3 0.8553  0.8742 0.8807 0.8829  0.8913 0.9127    0
+
+######
+# 4.
+# remove parch, then compare with RF3
+
+my_RF4 <- train(
+  survived ~ sex + title + fare + age + pclass + cabinbin + sibsp + farebin + familysize + embarked + agebin,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF4_imp <- varImp(my_RF4, scale = TRUE)
+plot(my_RF4_imp)
+
+# remove parch!
+# ROC 
+#       Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF3 0.8553  0.8742 0.8807 0.8829  0.8913 0.9127    0
+# RF4 0.8550  0.8730 0.8838 0.8844  0.8924 0.9133    0
+
+#######
+# 5.
+# remove cabinbin1, then compare with RF4
+dt <- rbind(training, testing)
+dt$cabinbin2 <- as.numeric(dt$cabinbin == 2)
+training <- dt[!is.na(dt$survived), ]
+testing <- dt[is.na(dt$survived), ]
+
+my_RF5 <- train(
+  survived ~ sex + title + fare + age + pclass + cabinbin2 + sibsp + farebin + familysize + embarked + agebin,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF5_imp <- varImp(my_RF5, scale = TRUE)
+plot(my_RF5_imp)
+
+## RF5 is better!
+# ROC 
+#       Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF4 0.8550  0.8730 0.8838 0.8844  0.8924 0.9133    0
+# RF5 0.8599  0.8768 0.8851 0.8848  0.8943 0.9138    0
+
+#######
+# 6. 
+# remove embarked Q, then compare with RF5
+dt <- rbind(training, testing)
+dt$embarkedS <- as.numeric(dt$embarked == 'S')
+training <- dt[!is.na(dt$survived), ]
+testing <- dt[is.na(dt$survived), ]
+
+my_RF6 <- train(
+  survived ~ sex + title + fare + age + pclass + cabinbin2 + sibsp + farebin + familysize + embarkedS + agebin,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF6_imp <- varImp(my_RF6, scale = TRUE)
+plot(my_RF6_imp)
+
+## RF6 doesn't provide any significant improvments upon RF5
+# ROC 
+#       Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF5 0.8599  0.8768 0.8851 0.8848  0.8943 0.9138    0
+# RF6 0.8587  0.8749 0.8841 0.8848  0.8937 0.9136    0
+
+#######
+# 7.
+# remove agebin, compare with RF5
+my_RF7 <- train(
+  survived ~ sex + title + fare + age + pclass + cabinbin2 + sibsp + farebin + familysize + embarked,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF7_imp <- varImp(my_RF7, scale = TRUE)
+plot(my_RF7_imp)
+
+## Improved! Current best, RF7
+# ROC 
+#       Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF5 0.8599  0.8768 0.8851 0.8848  0.8943 0.9138    0
+# RF7 0.8616  0.8774 0.8884 0.8864  0.8995 0.9151    0
+
+######
+# 8.
+# remove sex, compare with RF7
+# title contains information of sex
+my_RF8 <- train(
+  survived ~ title + fare + age + pclass + cabinbin2 + sibsp + farebin + familysize + embarked,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF8_imp <- varImp(my_RF8, scale = TRUE)
+plot(my_RF8_imp)
+
+# ROC 
+#       Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF7 0.8616  0.8774 0.8884 0.8864  0.8995 0.9151    0
+# RF8 0.8628  0.8804 0.8865 0.8879  0.9016 0.9157    0
+
+## surpriely, no improvement, keep sex
+## current best, RF8, (conciser is better)
+
+##### 
+# 9.
+# replace age with agebin
+# puzzle, why agebin is insignificant. replace age with agebin
+
+my_RF9 <- train(
+  survived ~ title + fare + agebin + pclass + cabinbin2 + sibsp + farebin + familysize + embarked,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF9_imp <- varImp(my_RF9, scale = TRUE)
+plot(my_RF9_imp)
+
+# agebin provides no improvement
+# ROC 
+#       Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF8 0.8628  0.8804 0.8865 0.8879  0.9016 0.9157    0
+# RF9 0.8470  0.8671 0.8777 0.8772  0.8862 0.9050    0
+
+#####
+# 10.
+# titlesir is of no value, combine it with title Master
+dt <- rbind(training, testing)
+dt$title2 <- as.character(dt$title)
+dt$title2[dt$title2 == 'Sir'] <- 'Master'
+dt$title2 <- as.factor(dt$title2)
+training <- dt[!is.na(dt$survived), ]
+testing <- dt[is.na(dt$survived), ]
+
+my_RF10 <- train(
+  survived ~ title2 + fare + age + pclass + cabinbin2 + sibsp + farebin + familysize + embarked,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF10_imp <- varImp(my_RF10, scale = TRUE)
+plot(my_RF10_imp)
+
+# No significant improvment. (only 17 samples are affected!)
+# ROC 
+#        Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF8  0.8628  0.8804 0.8865 0.8879  0.9016 0.9157    0
+# RF10 0.8612  0.8815 0.8868 0.8876  0.8998 0.9164    0
+#
+#
+# current best, RF10, RF8
+
+#####
+# 11.
+# remove sibsp. 
+my_RF11 <- train(
+  survived ~ title2 + fare + age + pclass + cabinbin2 + farebin + familysize + embarked,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF11_imp <- varImp(my_RF11, scale = TRUE)
+plot(my_RF11_imp)
+
+# RF11 is the best among these three!
+# ROC 
+#        Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF8  0.8628  0.8804 0.8865 0.8879  0.9016 0.9157    0
+# RF10 0.8658  0.8804 0.8854 0.8886  0.9023 0.9130    0
+# RF11 0.8649  0.8800 0.8876 0.8880  0.8984 0.9145    0
+#
+#
+# current best RF11
+
+#####
+# 12.
+# remove embarked
+my_RF12 <- train(
+  survived ~ title2 + fare + age + pclass + cabinbin2 + farebin + familysize,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501,
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF12_imp <- varImp(my_RF12, scale = TRUE)
+plot(my_RF12_imp)
+
+# Leave embarked in the model
+# 
+#        Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF12 0.8544  0.8755 0.8823 0.8839  0.8911 0.9150    0
+# RF10 0.8658  0.8804 0.8854 0.8886  0.9023 0.9130    0
+# RF11 0.8649  0.8800 0.8876 0.8880  0.8984 0.9145    0
+#
+# current best: RF 11
+
+#####
+# 13.
+# remove farebin, compare with RF 11
+my_RF13 <- train(
+  survived ~ title2 + fare + age + pclass + cabinbin2 + familysize + embarked,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF13_imp <- varImp(my_RF13, scale = TRUE)
+plot(my_RF13_imp)
+
+# Haha remove farebin
+# ROC 
+#        Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF13 0.8642  0.8782 0.8880 0.8884  0.8991 0.9140    0
+# RF10 0.8658  0.8804 0.8854 0.8886  0.9023 0.9130    0
+# RF11 0.8649  0.8800 0.8876 0.8880  0.8984 0.9145    0
+
+######
+# 14. 
+# remove embarked. (although we have the lesson, but it is so at the bottom)
+my_RF14 <- train(
+  survived ~ title2 + fare + age + pclass + cabinbin2 + familysize,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF14_imp <- varImp(my_RF14, scale = TRUE)
+plot(my_RF14_imp)
+
+# RF 14 is weak! dominate by others
+# ROC 
+#        Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF10 0.8658  0.8804 0.8854 0.8886  0.9023 0.9130    0
+# RF11 0.8649  0.8800 0.8876 0.8880  0.8984 0.9145    0
+# RF13 0.8642  0.8782 0.8880 0.8884  0.8991 0.9140    0
+# RF14 0.8592  0.8743 0.8828 0.8838  0.8929 0.9149    0
+
+######
+# 15.
+# combine title2Rev with Master
+dt <- rbind(training, testing)
+dt$title3 <- as.character(dt$title2)
+dt$title3[dt$title3 == 'Rev'] <- 'Master'
+dt$title3 <- as.factor(dt$title3)
+training <- dt[!is.na(dt$survived), ]
+testing <- dt[is.na(dt$survived), ]
+
+my_RF15 <- train(
+  survived ~ title3 + fare + age + pclass + cabinbin2 + familysize + embarked,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF15_imp <- varImp(my_RF15, scale = TRUE)
+plot(my_RF15_imp)
+
+RF_resamps <- resamples(list(RF10 = my_RF10,
+                             RF11 = my_RF11,
+                             RF13 = my_RF13,
+                             RF15 = my_RF15))
+summary(RF_resamps)
+bwplot(RF_resamps, layout = c(3, 1))
+splom(RF_resamps)
+
+# ROC 
+#        Min. 1st Qu. Median   Mean 3rd Qu.   Max. NA's
+# RF10 0.8658  0.8804 0.8854 0.8886  0.9023 0.9130    0
+# RF11 0.8649  0.8800 0.8876 0.8880  0.8984 0.9145    0
+# RF13 0.8642  0.8782 0.8880 0.8884  0.8991 0.9140    0
+# RF15 0.8632  0.8779 0.8886 0.8878  0.8993 0.9123    0
+#
+#
+# They are at a tie! RF10, RF11, RF13, RF15
+
+#####
+# 16.
+# Now consider some interaction terms
+# Include all second order interactions, then only keep top 10.
+my_RF16 <- train(
+  survived ~ (title3 + age + pclass + fare + cabinbin2 + familysize + embarked)^2,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF16_imp <- varImp(my_RF16, scale = TRUE)
+plot(my_RF16_imp)
+
+RF_resamps <- resamples(list(RF10 = my_RF10,
+                             RF11 = my_RF11,
+                             RF13 = my_RF13,
+                             RF15 = my_RF15,
+                             RF16 = my_RF16))
+summary(RF_resamps)
+bwplot(RF_resamps, layout = c(3, 1))
+splom(RF_resamps)
+
+##### 
+# 17.
+# Add title3Ms:fare
+dt <- rbind(training, testing)
+dt$title3Ms_fare <- as.numeric(dt$title3 == 'Ms') * dt$fare
+training <- dt[!is.na(dt$survived), ]
+testing <- dt[is.na(dt$survived), ]
+
+my_RF17 <- train(
+  survived ~ title3 + age + pclass + fare + cabinbin2 + familysize + embarked + 
+    title3Ms_fare,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF17_imp <- varImp(my_RF17, scale = TRUE)
+plot(my_RF17_imp)
+
+RF_resamps <- resamples(list(RF10 = my_RF10,
+                             RF11 = my_RF11,
+                             RF13 = my_RF13,
+                             RF15 = my_RF15,
+                             RF_best = my_RF_best))
+summary(RF_resamps)
+bwplot(RF_resamps, layout = c(3, 1))
+splom(RF_resamps)
+
+#######
+# 18
+# use the same variable as in 13, method = cforest instead
+
+my_Ctree <- train(
+  as.factor(survived) ~ title2 + fare + age + pclass + cabinbin2 + familysize + embarked,
+  data = training, 
+  method = 'ctree',
+  tuneGrid = expand.grid(mincriterion = 0.95)
+)
+
+######
+# 19
+
+my_RPART <- train(
+  survived ~ sex + title + fare + age + pclass + cabinbin + sibsp + farebin + familysize + parch + embarked + agebin,
+  data = training, 
+  method = 'rpart',
+  tuneLength = 30,
+  trControl = my_control
+)
+
+##########
+
+err <- c()
+
+for (i in -100:100) {
+  prob = 0.5 + 0.001 * i
+  my_rpart_pred <- pred(my_RF3, training, prob)
+  my_rpart_pred <- factor(as.factor(my_rpart_pred), labels = c('No', 'Yes'))
+  err <- c(err, sum(my_rpart_pred != training$survived))
+}
+
+err
+```
+
+
+```{r prediction}
+###
+# best public score is given by RF3
+
+pred <- function(my_model, dt = testing, prob = 0.5) {
+  testing_pred <- predict(my_model, newdata = dt, type = 'prob')
+  testing_pred <- testing_pred[[1]]
+  testing_pred <- as.numeric(testing_pred > prob)
+}
+
+submit <- function(testing_pred, name = 'new', dt = testing) {
+  write.csv(data.frame(PassengerId = testing$passengerid, Survived = as.numeric(testing_pred)), 
+            file = paste(name, ".csv", sep = ""), row.names = F)
+}
+```
+
+## ROC curve
+
+```{r roc}
+####
+# best model RF3
+my_control <- trainControl(
+  method='repeatedcv',
+  number=5,
+  repeats=5,
+  savePredictions=TRUE,
+  classProbs=TRUE,
+  index=createResample(training$survived, 25),
+  summaryFunction=twoClassSummary
+)
+
+my_grid <- expand.grid(.mtry = 3)
+
+my_RF3 <- train(
+  survived ~ sex + title + fare + age + pclass + cabinbin + sibsp + farebin + familysize + parch + embarked + agebin,
+  data = training, 
+  method = 'rf',
+  importance = T, 
+  ntree = 501, 
+  tuneGrid = my_grid,
+  trControl = my_control
+)
+
+my_RF3_imp <- varImp(my_RF3, scale = TRUE)
+plot(my_RF3_imp)
+
+## prediction
+
+my_pred <- predict(my_RF3, training, 'prob')
+my_pred <- cbind(training, my_pred)
+
+threshold = 0.5
+
+v <- rep(NA, nrow(my_pred))
+v <- ifelse(my_pred$Yes >= threshold & my_pred$survived == 'Yes', "TP", v)
+v <- ifelse(my_pred$Yes >= threshold & my_pred$survived == 'No', "FP", v)
+v <- ifelse(my_pred$Yes < threshold & my_pred$survived == 'Yes', "FN", v)
+v <- ifelse(my_pred$Yes < threshold & my_pred$survived == 'No', "TN", v)
+
+my_pred$pred_type <- v
+
+ggplot(data=my_pred, aes(x=survived, y=Yes)) + 
+  geom_violin(fill=rgb(1,1,1,alpha=0.6), color=NA) + 
+  geom_jitter(aes(color=pred_type), shape=1) +
+  geom_hline(yintercept=threshold, color="red", alpha=0.6) +
+  scale_color_discrete(name = "type") +
+  labs(title=sprintf("Threshold at %.2f", threshold))
+
+# calculate ROC
+
+calculate_roc <- function(df, cost_of_fp = 1, cost_of_fn = 1, n=100) {
+  tpr <- function(df, threshold) {
+    sum(df$Yes >= threshold & df$survived == 'Yes') / sum(df$survived == 'Yes')
+  }
+  
+  fpr <- function(df, threshold) {
+    sum(df$Yes >= threshold & df$survived == 'No') / sum(df$survived == 'No')
+  }
+  
+  cost <- function(df, threshold, cost_of_fp, cost_of_fn) {
+    sum(df$Yes >= threshold & df$survived == 'No') * cost_of_fp + 
+      sum(df$Yes < threshold & df$survived == 'Yes') * cost_of_fn
+  }
+  
+  roc <- data.frame(threshold = seq(0,1,length.out=n), tpr=NA, fpr=NA)
+  roc$tpr <- sapply(roc$threshold, function(th) tpr(df, th))
+  roc$fpr <- sapply(roc$threshold, function(th) fpr(df, th))
+  roc$cost <- sapply(roc$threshold, function(th) cost(df, th, cost_of_fp, cost_of_fn))
+  
+  return(roc)
+}
+
+my_roc <- calculate_roc(my_pred)
+
+head(my_roc)
+
+plot_roc <- function(roc, threshold = 0.5, cost_of_fp = 1, cost_of_fn = 1) {
+  library(gridExtra)
+  
+  norm_vec <- function(v) (v - min(v))/diff(range(v))
+  
+  idx_threshold = which.min(abs(roc$threshold-threshold))
+  
+  col_ramp <- colorRampPalette(c("green","orange","red","black"))(100)
+  col_by_cost <- col_ramp[ceiling(norm_vec(roc$cost)*99)+1]
+  p_roc <- ggplot(roc, aes(fpr,tpr)) + 
+    geom_line(color=rgb(0,0,1,alpha=0.3)) +
+    geom_point(color=col_by_cost, size=4, alpha=0.5) +
+    coord_fixed() +
+    geom_line(aes(threshold,threshold), color=rgb(0,0,1,alpha=0.5)) +
+    labs(title = sprintf("ROC")) + xlab("FPR") + ylab("TPR") +
+    geom_hline(yintercept=roc[idx_threshold,"tpr"], alpha=0.5, linetype="dashed") +
+    geom_vline(xintercept=roc[idx_threshold,"fpr"], alpha=0.5, linetype="dashed")
+  
+  p_cost <- ggplot(roc, aes(threshold, cost)) +
+    geom_line(color=rgb(0,0,1,alpha=0.3)) +
+    geom_point(color=col_by_cost, size=4, alpha=0.5) +
+    labs(title = sprintf("cost function")) +
+    geom_vline(xintercept=threshold, alpha=0.5, linetype="dashed")
+  
+  sub_title <- sprintf("threshold at %.2f - cost of FP = %d, cost of FN = %d", threshold, cost_of_fp, cost_of_fn)
+
+  grid.arrange(p_roc, p_cost, ncol=2, sub=textGrob(sub_title, gp=gpar(cex=1), just="bottom"))
+}
+
+plot_roc(my_roc, 0.5, 1, 2)
+```

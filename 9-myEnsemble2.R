@@ -76,3 +76,89 @@ ens_preds <- predict(greedy_ensemble, newdata=testing)
 model_preds$ensemble <- ens_preds
 
 write.csv(data.frame(PassengerId = testing$PassengerId, Survived = as.numeric(ens_preds > 0.5)), file = "myEnsemble.csv", row.names = F)
+
+
+###############
+
+training <- within(training, survived <- factor(as.factor(survived), labels = c('No', 'Yes')))
+training <- within(training, pclass <- as.factor(pclass))
+
+my_control <- trainControl(
+  method='repeatedcv',
+  number=5,
+  repeats=5,
+  savePredictions=TRUE,
+  classProbs=TRUE,
+  index=createResample(training$survived, 25),
+  summaryFunction=twoClassSummary
+)
+
+model_list_1 <- caretList(
+  survived ~ (pclass + age + title) ^ 2 + fare + cabinbin + embarked + sibspbin, data=training,
+  trControl=my_control,
+  metric='ROC',
+  methodList=c('gbm', 'rpart', 'glmnet'),
+  tuneList=list(
+    rf=caretModelSpec(method='rf', ntree = 1501),
+    svmRadial = caretModelSpec(method='svmRadial', proProc = c("center", "scale"), tuneLength = 8),
+    svmLinear = caretModelSpec(method='svmLinear', tuneLength = 8), 
+    nn=caretModelSpec(method='nnet', tuneLength=2, trace=FALSE)
+  )
+)
+
+## compare different models
+ggplot(model_list_1$gbm)
+
+model_resamps_1 <- resamples(model_list_1)
+
+bwplot(model_resamps_1, layout = c(3, 1))
+splom(model_resamps_1)
+model_difValues_1 <- diff(model_resamps_1)
+summary(model_difValues_1)
+trellis.par.set(caretTheme())
+bwplot(model_difValues_1, layout = c(3, 1))
+trellis.par.set(caretTheme())
+dotplot(model_difValues_1)
+
+sort(sapply(model_list_1, function(x) min(x$results$ROC)), decreasing = T)
+
+
+modelCor(resamples(model_list))
+
+p <- predict(model_list, newdata=training)
+print(p)
+
+greedy_ensemble <- caretEnsemble(model_list)
+summary(greedy_ensemble)
+
+modelCor(resamples(model_list))
+
+#### calibration
+
+training_preds <- lapply(model_list_1, predict, newdata = training, type = 'prob')
+training_preds <- lapply(training_preds, function(x) x[, 'Yes'])
+training_preds <- data.frame(training_preds)
+
+training_miss <- training[(training$survived == 'Yes') != (training_preds$rf > 0.5), ]
+
+table(training_miss$sex, training_miss$survived)
+
+training_miss[which(training_miss$survived=="No"),]
+
+#### ensemble
+
+greedy_ensemble <- caretEnsemble(model_list)
+summary(greedy_ensemble)
+
+#### predict
+
+testing <- within(testing, pclass <- as.factor(pclass))
+testing_preds <- lapply(model_list_1, predict, newdata=testing, type='prob')
+testing_preds <- lapply(testing_preds, function(x) x[,'Yes'])
+testing_preds <- data.frame(testing_preds)
+
+ens_preds <- predict(greedy_ensemble, newdata=testing)
+model_preds$ensemble <- ens_preds
+write.csv(data.frame(PassengerId = testing$passengerid, Survived = as.numeric(testing_preds$rf > 0.5)), file = "myRF_new.csv", row.names = F)
+
+#################
